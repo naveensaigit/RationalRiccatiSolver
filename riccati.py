@@ -1,5 +1,5 @@
 from sympy import *
-from sympy.solvers.ode.ode import get_numbered_constants
+from sympy.solvers.ode.ode import get_numbered_constants, _remove_redundant_solutions, constantsimp
 
 def find_riccati_sol(eq, log=False):
     """
@@ -12,7 +12,7 @@ def find_riccati_sol(eq, log=False):
     eq = eq.expand().collect(w)
     cf = eq.coeff(w.diff(x))
     eq = Add(*map(lambda x: cancel(x/cf), eq.args)).collect(w)
-    b0, b1, b2 = match_riccati(eq)
+    b0, b1, b2 = match_riccati(eq, w, x)
 
     # Step 1 : Convert to Normal Form
     a = -b0*b2 + b1**2/4 - b1.diff(x)/2 + 3*b2.diff(x)**2/(4*b2**2) + b1*b2.diff(x)/(2*b2) - b2.diff(x, 2)/(2*b2)
@@ -63,7 +63,8 @@ def find_riccati_sol(eq, log=False):
             # Step 8 and 9 : Compute m and ybar
             m, ybar = compute_degree(x, poles, choice, c, d, -val_inf//2)
             if log:
-                print("M and Ybar", m, ybar)
+                print("M", m)
+                print("Ybar", ybar)
             # Step 10 : Check if m is non-negative integer
             if m.is_real and m >= 0 and m.is_integer:
                 # Step 11 : Find polynomial solutions of degree m for the auxiliary equation
@@ -125,6 +126,7 @@ def test_riccati_sol():
     # Example 4.4.8 - Rational and Algebraic Solutions of First-Order Algebraic ODEs
     # (https://www3.risc.jku.at/publications/download/risc_5387/PhDThesisThieu.pdf)
 
+    # Takes too long!
     # eq = f(x).diff(x) + (3*x**2 + 1)*f(x)**2/x + (6*x**2 - x + 3)*f(x)/(x*(x - 1)) + (3*x**2 - 2*x + 2)/(x*(x - 1)**2)
     # sols = list(map(lambda x: x.simplify(), find_riccati_sol(eq)))
     # assert sols == [(-27*x**5 + 27*x**4 + 18*sqrt(3)*I*x**4 - 45*x**3 - 18*sqrt(3)*I*x**3 - 9*x**2 +
@@ -345,9 +347,7 @@ def construct_c(a, x, poles, muls):
             c[-1].extend([temp, temp1])
     return c
 
-def match_riccati(eq):
-    w = list(eq.atoms(Derivative))[0].args[0]
-    x = list(w.free_symbols)[0]
+def match_riccati(eq, w, x):
     b0 = Wild('b0', exclude=[w, w.diff(x)])
     b1 = Wild('b1', exclude=[w, w.diff(x)])
     b2 = Wild('b2', exclude=[w, w.diff(x)])
@@ -369,3 +369,71 @@ def find_poles(a, x):
 def val_at_inf(a, x):
     num, denom = a.as_numer_denom()
     return degree(denom, x) - degree(num, x)
+
+def match_2nd_order(eq, z, x):
+    a = Wild('a', exclude=[z, z.diff(x), z.diff(x)*2])
+    b = Wild('b', exclude=[z, z.diff(x), z.diff(x)*2])
+    c = Wild('c', exclude=[z, z.diff(x), z.diff(x)*2])
+    match = eq.match(a*z.diff(x, 2) + b*z.diff(x) + c*z)
+
+    if a not in match or b not in match or c not in match:
+        raise ValueError("Invalid Second Order Linear Homogeneous Equation")
+    return match[a], match[b], match[c]
+
+def find_kovacic_simple(x, a, b, c):
+    # Find solution for y(x).diff(x, 2) = r(x)*y(x)
+    r = (b**2 + 2*a*b.diff(x) - 2*a.diff(x)*b - 4*a*c)/4*a**2
+
+    fric = Function('fric')
+    ric_sol = find_riccati_sol(fric(x).diff(x) + fric(x)**2 - r)
+
+    C1 = Symbol('C1')
+    return set(map(lambda sol: exp(Integral(sol.subs(C1, 0), x).doit()), ric_sol))
+    
+def find_kovacic_sol(eq):
+    z = list(eq.atoms(Derivative))[0].args[0]
+    x = list(z.free_symbols)[0]
+    eq = eq.expand().collect(z)
+    a, b, c = match_2nd_order(eq, z, x)
+
+    # Transform the differential equation to a simpler form
+    # using z(x) = y(x)*exp(Integral(-b/(2*a))) and find its solution
+    ysol = find_kovacic_simple(x, a, b, c)
+
+    zsol = list(map(lambda sol: sol*exp(Integral(-b/(2*a), x).doit()), ysol))
+    zsol = _remove_redundant_solutions(Eq(eq, 0), list(map(lambda sol: Eq(z, sol), zsol)), 2, x)
+
+    C1, C2 = symbols('C1 C2')
+    if len(zsol) == 2:
+        return constantsimp(Eq(z, C1*zsol[0].rhs + C2*zsol[1].rhs), [C1, C2])
+    if len(zsol) == 1:
+        sol1 = zsol[0].rhs
+        sol2 = sol1*Integral(exp(Integral(-b, x).doit())/sol1**2, x)
+        zsol.append(Eq(z, sol2))
+        return constantsimp(Eq(z, C1*zsol[0].rhs + C2*zsol[1].rhs), [C1, C2])
+    return zsol
+
+def test_kovacic_sol():
+    eq = f(x).diff(x, 2) - (x**2 + 3)*f(x)
+    sol = find_kovacic_sol(eq)
+    assert checkodesol(eq, sol)
+
+    eq = f(x).diff(x, 2) - 2*f(x)/x**2
+    sol = find_kovacic_sol(eq)
+    assert checkodesol(eq, sol)
+
+    eq = f(x).diff(x, 2) + (3/(16*x**2*(x - 1)**2))*f(x)
+    sol = find_kovacic_sol(eq)
+    assert checkodesol(eq, sol)
+
+    # eq = f(x).diff(x, 2) - f(x)/(8*(25*x + 16)**2*(x - 2)**2)
+    # sol = find_kovacic_sol(eq)
+    # assert checkodesol(eq, sol)
+
+    eq = f(x).diff(x, 2) - (9*x**2/4 - S(21)/2)*f(x)
+    sol = find_kovacic_sol(eq)
+    assert checkodesol(eq, sol)
+    
+    eq = f(x).diff(x, 2) + 3*x*f(x).diff(x) + 12*f(x)
+    sol = find_kovacic_sol(eq)
+    assert checkodesol(eq, sol)
